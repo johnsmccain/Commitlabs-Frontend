@@ -1,5 +1,4 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { z } from 'zod';
 import { checkRateLimit } from '@/lib/backend/rateLimit';
 import {
   getCommitmentFromChain,
@@ -14,31 +13,43 @@ import {
 import { withApiHandler } from '@/lib/backend/withApiHandler';
 import { ok } from '@/lib/backend/apiResponse';
 import { getMockData } from '@/lib/backend/mockDb';
-import {
-  validateAttestationData,
-  type AttestationData,
-} from '@/lib/backend/attestationSchemas';
-import { ATTESTATION_TYPES } from '@/lib/types/domain';
-import type { AttestationType } from '@/lib/types/domain';
 import type { RecordAttestationOnChainParams } from '@/lib/backend/services/contracts';
 
-export type { AttestationType };
+const ATTESTATION_TYPES = [
+  'health_check',
+  'violation',
+  'fee_generation',
+  'drawdown',
+] as const;
+
+export type AttestationType = (typeof ATTESTATION_TYPES)[number];
 
 function isAttestationType(value: unknown): value is AttestationType {
-  return typeof value === 'string' && (ATTESTATION_TYPES as readonly string[]).includes(value);
+  return typeof value === 'string' && ATTESTATION_TYPES.includes(value as AttestationType);
 }
 
 export interface RecordAttestationRequestBody {
   commitmentId: string;
   attestationType: AttestationType;
-  /** Validated and normalised — only allowlisted keys for the given type. */
-  data: AttestationData;
+  data: Record<string, unknown>;
   verifiedBy: string;
+}
+
+function ensureObject(value: unknown, field: string): Record<string, unknown> {
+  if (value === null || value === undefined) {
+    throw new ValidationError(`Missing required field: ${field}.`, { field });
+  }
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    throw new ValidationError(`Field "${field}" must be an object.`, { field });
+  }
+  return value as Record<string, unknown>;
 }
 
 function ensureNonEmptyString(value: unknown, field: string): string {
   if (typeof value !== 'string' || value.trim() === '') {
-    throw new ValidationError(`Field "${field}" must be a non-empty string.`, { field });
+    throw new ValidationError(`Field "${field}" must be a non-empty string.`, {
+      field,
+    });
   }
   return value.trim();
 }
@@ -50,65 +61,89 @@ function parseAndValidateBody(raw: unknown): RecordAttestationRequestBody {
   }
 
   const commitmentId = ensureNonEmptyString(body.commitmentId, 'commitmentId');
-
   const attestationType = body.attestationType;
   if (!isAttestationType(attestationType)) {
     throw new ValidationError(
       `Invalid attestationType. Must be one of: ${ATTESTATION_TYPES.join(', ')}.`,
-      { field: 'attestationType', allowed: ATTESTATION_TYPES },
+      { field: 'attestationType', allowed: ATTESTATION_TYPES }
     );
   }
-
-  if (body.data === null || body.data === undefined || typeof body.data !== 'object' || Array.isArray(body.data)) {
-    throw new ValidationError('Field "data" must be an object.', { field: 'data' });
-  }
-
-  // Validate data against the per-type allowlisted schema
-  let data: AttestationData;
-  try {
-    data = validateAttestationData(attestationType, body.data);
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'PAYLOAD_TOO_LARGE') {
-      throw new ValidationError((err as Error).message, { field: 'data' });
-    }
-    if (err instanceof z.ZodError) {
-      const first = err.issues[0];
-      const fieldPath = ['data', ...first.path].join('.');
-      throw new ValidationError(first.message, { field: fieldPath, issues: err.issues });
-    }
-    throw err;
-  }
-
+  const data = ensureObject(body.data, 'data');
   const verifiedBy = ensureNonEmptyString(body.verifiedBy, 'verifiedBy');
 
-  return { commitmentId, attestationType, data, verifiedBy };
+  if (attestationType === 'health_check') {
+    const score = data.complianceScore;
+    if (score === undefined || score === null) {
+      throw new ValidationError(
+        'data.complianceScore is required for attestationType "health_check".',
+        { field: 'data.complianceScore' }
+      );
+    }
+    const num = Number(score);
+    if (!Number.isFinite(num) || num < 0 || num > 100) {
+      throw new ValidationError(
+        'data.complianceScore must be a number between 0 and 100.',
+        { field: 'data.complianceScore' }
+      );
+    }
+  }
+
+  if (attestationType === 'fee_generation') {
+    const feeEarned = data.feeEarned ?? data.amount;
+    if (feeEarned === undefined || feeEarned === null) {
+      throw new ValidationError(
+        'data.feeEarned or data.amount is required for attestationType "fee_generation".',
+        { field: 'data' }
+      );
+    }
+  }
+
+  return {
+    commitmentId,
+    attestationType,
+    data,
+    verifiedBy,
+  };
 }
 
 function mapToRecordParams(
-  body: RecordAttestationRequestBody,
+  body: RecordAttestationRequestBody
 ): RecordAttestationOnChainParams {
   const { commitmentId, attestationType, data, verifiedBy } = body;
   const timestamp = new Date().toISOString();
-
-  // All fields are now guaranteed to be valid and normalised by the schema.
-  const d = data as Record<string, unknown>;
 
   let complianceScore = 0;
   let violation = false;
   let feeEarned: string | undefined;
 
   if (attestationType === 'health_check') {
-    complianceScore = d.complianceScore as number;
-    violation = (d.violation as boolean) ?? false;
+    complianceScore = Number(data.complianceScore);
+    violation = Boolean(data.violation);
   } else if (attestationType === 'violation') {
     violation = true;
-    complianceScore = typeof d.complianceScore === 'number' ? (d.complianceScore as number) : 0;
+    complianceScore =
+      typeof data.complianceScore === 'number' && Number.isFinite(data.complianceScore)
+        ? data.complianceScore
+        : 0;
   } else if (attestationType === 'fee_generation') {
-    feeEarned = d.feeEarned as string; // already coerced to string by schema
-    complianceScore = typeof d.complianceScore === 'number' ? (d.complianceScore as number) : 0;
+    const raw = data.feeEarned ?? data.amount;
+    feeEarned =
+      typeof raw === 'string' ? raw : typeof raw === 'number' ? String(raw) : '0';
+    complianceScore =
+      typeof data.complianceScore === 'number' && Number.isFinite(data.complianceScore)
+        ? data.complianceScore
+        : 0;
   } else {
-    // drawdown
-    complianceScore = typeof d.complianceScore === 'number' ? (d.complianceScore as number) : 0;
+    complianceScore =
+      typeof data.complianceScore === 'number' && Number.isFinite(data.complianceScore)
+        ? data.complianceScore
+        : 0;
+    violation = Boolean(data.violation);
+    const rawFee = data.feeEarned ?? data.amount;
+    if (rawFee !== undefined && rawFee !== null) {
+      feeEarned =
+        typeof rawFee === 'string' ? rawFee : typeof rawFee === 'number' ? String(rawFee) : undefined;
+    }
   }
 
   return {
@@ -118,23 +153,30 @@ function mapToRecordParams(
     violation,
     feeEarned,
     timestamp,
-    details: { type: attestationType, ...d },
+    details: { type: attestationType, ...data },
   };
 }
 
 export const GET = withApiHandler(async (req: NextRequest) => {
   const ip = req.ip ?? req.headers.get('x-forwarded-for') ?? 'anonymous';
+
   const isAllowed = await checkRateLimit(ip, 'api/attestations');
-  if (!isAllowed) throw new TooManyRequestsError();
+  if (!isAllowed) {
+    throw new TooManyRequestsError();
+  }
 
   const { attestations } = await getMockData();
+
   return ok({ attestations }, 200);
 });
 
 export const POST = withApiHandler(async (req: NextRequest) => {
   const ip = req.ip ?? req.headers.get('x-forwarded-for') ?? 'anonymous';
+
   const isAllowed = await checkRateLimit(ip, 'api/attestations');
-  if (!isAllowed) throw new TooManyRequestsError();
+  if (!isAllowed) {
+    throw new TooManyRequestsError();
+  }
 
   let body: RecordAttestationRequestBody;
   try {
@@ -154,26 +196,31 @@ export const POST = withApiHandler(async (req: NextRequest) => {
       status: 502,
       details: { commitmentId: body.commitmentId },
     });
-    return NextResponse.json(toBackendErrorResponse(normalized), { status: normalized.status });
+    return NextResponse.json(toBackendErrorResponse(normalized), {
+      status: normalized.status,
+    });
   }
 
   const params = mapToRecordParams(body);
 
   try {
     const result = await recordAttestationOnChain(params);
+
+    const summary = {
+      attestationId: result.attestationId,
+      commitmentId: result.commitmentId,
+      complianceScore: result.complianceScore,
+      violation: result.violation,
+      feeEarned: result.feeEarned,
+      recordedAt: result.recordedAt,
+    };
+
     return ok(
       {
-        attestation: {
-          attestationId: result.attestationId,
-          commitmentId: result.commitmentId,
-          complianceScore: result.complianceScore,
-          violation: result.violation,
-          feeEarned: result.feeEarned,
-          recordedAt: result.recordedAt,
-        },
+        attestation: summary,
         txReference: result.txHash ?? null,
       },
-      201,
+      201
     );
   } catch (err) {
     const normalized = normalizeBackendError(err, {
@@ -182,6 +229,8 @@ export const POST = withApiHandler(async (req: NextRequest) => {
       status: 502,
       details: { commitmentId: body.commitmentId, attestationType: body.attestationType },
     });
-    return NextResponse.json(toBackendErrorResponse(normalized), { status: normalized.status });
+    return NextResponse.json(toBackendErrorResponse(normalized), {
+      status: normalized.status,
+    });
   }
 });
